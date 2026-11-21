@@ -38,6 +38,12 @@ class PublishedRow:
     value: float
 
 
+@dataclass
+class ActualsRow:
+    node_id: str
+    quantity: int
+
+
 def _read_text(data: bytes, filename: str) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -156,4 +162,41 @@ def parse_published(data: bytes, filename: str) -> list[PublishedRow]:
                 value=_parse_float(row.get("value", ""), "value", idx),
             )
         )
+    return result
+
+
+def parse_actuals(data: bytes, filename: str) -> list[ActualsRow]:
+    """Actual production figures: one shop or line id and a non-negative integer.
+
+    Accepted headers: ``node_id, quantity`` (as documented) or the aliases
+    ``node_id, value`` / ``node_id, qty``.  A line may appear several times in
+    one batch; the caller decides whether that is a correction (last wins) or a
+    conflict.
+    """
+    headers, rows = _rows(data, filename)
+    _require(headers, {"node_id"}, filename)
+    quantity_col = next(
+        (c for c in ("quantity", "value", "qty", "actual") if c in headers), None
+    )
+    if quantity_col is None:
+        raise CsvParseError(
+            f"文件 {filename} 缺少数量列：需要 quantity（也接受 value / qty）；"
+            f"实际列为 {', '.join(headers)}。"
+        )
+    result: list[ActualsRow] = []
+    for idx, row in enumerate(rows, start=2):
+        node_id = row.get("node_id", "")
+        if not node_id:
+            raise CsvParseError(f"第 {idx} 行缺少 node_id。")
+        raw = row.get(quantity_col, "")
+        try:
+            number = float(raw.replace(",", ""))
+        except (TypeError, ValueError):
+            raise CsvParseError(f"第 {idx} 行的 {quantity_col} 不是数字：{raw!r}") from None
+        if not number.is_integer():
+            raise CsvParseError(f"第 {idx} 行的 {quantity_col} 必须是整数：{raw!r}")
+        quantity = int(number)
+        if quantity < 0:
+            raise CsvParseError(f"第 {idx} 行的 {quantity_col} 不能为负数：{raw!r}")
+        result.append(ActualsRow(node_id, quantity))
     return result

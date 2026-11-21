@@ -76,6 +76,45 @@ CREATE TABLE IF NOT EXISTS events (
     detail_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_dataset ON events(dataset_id, id);
+
+-- Actual production figures reported against a published snapshot version.
+-- They are scoped per snapshot version and period so an immutable snapshot
+-- always shows the actuals that were reconciled against it.
+CREATE TABLE IF NOT EXISTS actual_values (
+    dataset_id      INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    version_number  INTEGER NOT NULL,
+    period          TEXT    NOT NULL,
+    node_id         TEXT    NOT NULL,
+    kind            TEXT    NOT NULL CHECK (kind IN ('line','shop')),
+    quantity        INTEGER NOT NULL CHECK (quantity >= 0),
+    updated_at      TEXT    NOT NULL,
+    batch_id        INTEGER,
+    PRIMARY KEY (dataset_id, version_number, period, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS actual_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id      INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    version_number  INTEGER NOT NULL,
+    period          TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    filename        TEXT,
+    status          TEXT    NOT NULL CHECK (status IN ('applied','rejected')),
+    message         TEXT,
+    row_count       INTEGER NOT NULL,
+    details_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_actual_batches
+    ON actual_batches(dataset_id, version_number, period, id);
+
+CREATE TABLE IF NOT EXISTS actual_reconciliations (
+    dataset_id      INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    version_number  INTEGER NOT NULL,
+    period          TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    result_json     TEXT    NOT NULL,
+    PRIMARY KEY (dataset_id, version_number, period)
+);
 """
 
 
@@ -387,3 +426,194 @@ class Database:
             "parent_id": row["parent_id"],
             "result": json.loads(row["result_json"]),
         }
+
+    # ------------------------------------------------------------------
+    # Actual production figures (scoped to a published snapshot version)
+    # ------------------------------------------------------------------
+    def actual_values(
+        self,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Stored actuals for one snapshot version/period, keyed by node id."""
+        query = """SELECT node_id, kind, quantity, updated_at
+                   FROM actual_values
+                   WHERE dataset_id=? AND version_number=? AND period=?"""
+        if conn is not None:
+            rows = conn.execute(query, (dataset_id, version_number, period)).fetchall()
+        else:
+            with self.connect() as own_conn:
+                rows = own_conn.execute(query, (dataset_id, version_number, period)).fetchall()
+        return {
+            r["node_id"]: {
+                "node_id": r["node_id"],
+                "kind": r["kind"],
+                "quantity": int(r["quantity"]),
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        }
+
+    def all_actuals(
+        self, dataset_id: int, version_number: int
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """All actuals for a snapshot version: ``{period: {node_id: value}}``."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT period, node_id, kind, quantity, updated_at
+                   FROM actual_values
+                   WHERE dataset_id=? AND version_number=?""",
+                (dataset_id, version_number),
+            ).fetchall()
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["period"], {})[r["node_id"]] = {
+                "node_id": r["node_id"],
+                "kind": r["kind"],
+                "quantity": int(r["quantity"]),
+                "updated_at": r["updated_at"],
+            }
+        return out
+
+    def record_actual_batch(
+        self,
+        conn: sqlite3.Connection,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        filename: str | None,
+        status: str,
+        message: str,
+        row_count: int,
+        details: Any = None,
+    ) -> int:
+        cur = conn.execute(
+            """INSERT INTO actual_batches
+               (dataset_id, version_number, period, created_at, filename, status,
+                message, row_count, details_json)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                dataset_id,
+                version_number,
+                period,
+                utc_now(),
+                filename,
+                status,
+                message,
+                row_count,
+                None if details is None else json.dumps(details, ensure_ascii=False, default=str),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def upsert_actual_values(
+        self,
+        conn: sqlite3.Connection,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        values: dict[str, tuple[str, int]],
+        batch_id: int,
+    ) -> None:
+        """Merge the given ``{node_id: (kind, quantity)}`` into stored actuals."""
+        now = utc_now()
+        for node_id, (kind, quantity) in values.items():
+            conn.execute(
+                """INSERT INTO actual_values
+                   (dataset_id, version_number, period, node_id, kind, quantity, updated_at, batch_id)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT (dataset_id, version_number, period, node_id)
+                   DO UPDATE SET kind=excluded.kind, quantity=excluded.quantity,
+                                 updated_at=excluded.updated_at, batch_id=excluded.batch_id""",
+                (dataset_id, version_number, period, node_id, kind, quantity, now, batch_id),
+            )
+
+    def save_actual_reconciliation(
+        self,
+        conn: sqlite3.Connection,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        result: Any,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO actual_reconciliations
+               (dataset_id, version_number, period, updated_at, result_json)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT (dataset_id, version_number, period)
+               DO UPDATE SET updated_at=excluded.updated_at, result_json=excluded.result_json""",
+            (
+                dataset_id,
+                version_number,
+                period,
+                utc_now(),
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+
+    def get_actual_reconciliation(
+        self,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        query = """SELECT result_json, updated_at FROM actual_reconciliations
+                   WHERE dataset_id=? AND version_number=? AND period=?"""
+        if conn is not None:
+            row = conn.execute(query, (dataset_id, version_number, period)).fetchone()
+        else:
+            with self.connect() as own_conn:
+                row = own_conn.execute(query, (dataset_id, version_number, period)).fetchone()
+        if row is None:
+            return None
+        return {
+            "result": json.loads(row["result_json"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def list_actual_reconciliations(
+        self, dataset_id: int, version_number: int
+    ) -> dict[str, dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT period, result_json, updated_at FROM actual_reconciliations
+                   WHERE dataset_id=? AND version_number=?""",
+                (dataset_id, version_number),
+            ).fetchall()
+        return {
+            r["period"]: {
+                "result": json.loads(r["result_json"]),
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        }
+
+    def list_actual_batches(
+        self,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM actual_batches
+                   WHERE dataset_id=? AND version_number=? AND period=?
+                   ORDER BY id DESC LIMIT ?""",
+                (dataset_id, version_number, period, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"],
+                "filename": r["filename"],
+                "status": r["status"],
+                "message": r["message"],
+                "row_count": r["row_count"],
+                "details": json.loads(r["details_json"]) if r["details_json"] else None,
+            }
+            for r in rows
+        ]

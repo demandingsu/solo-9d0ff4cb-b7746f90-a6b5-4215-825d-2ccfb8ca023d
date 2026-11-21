@@ -108,6 +108,7 @@ input[type=text], input[type=file] {
 .upload:first-of-type { border-top: none; }
 .upload-head { display: flex; justify-content: space-between; align-items: center; }
 .file-meta { margin: 4px 0 8px; color: var(--muted); font-size: 13px; }
+.upload-inline { border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
 
 .banner { border-radius: 8px; padding: 10px 14px; margin: 12px 0; font-size: 14px; }
 .banner-error { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }

@@ -1,6 +1,15 @@
 {% extends "base.html" %}
 {% import "_result.html" as ui with context %}
 {% block title %}快照 v{{ snapshot.version_number }} · {{ dataset.name }}{% endblock %}
+
+{% macro num(v) %}{% if v is none %}—{% else %}{{ "%.3f"|format(v) }}{% endif %}{% endmacro %}
+{% macro intfmt(v) %}{% if v is none %}—{% else %}{{ "%d"|format(v) }}{% endif %}{% endmacro %}
+{% macro shop_status(s) %}
+  {% if s.status == 'total_reported' %}<span class="pill pill-info">已报总量 · 余额对未报产线</span>
+  {% elif s.status == 'fully_reported' %}<span class="pill pill-ok">产线已报齐</span>
+  {% else %}<span class="pill pill-warn">未报总量 · 未报产线缺数</span>{% endif %}
+{% endmacro %}
+
 {% block content %}
 <section class="card dataset-head">
   <div>
@@ -12,10 +21,158 @@
   </div>
   <div class="head-actions">
     <a class="button ghost" href="/datasets/{{ dataset.id }}">返回数据集</a>
+    <a class="button ghost" href="/api/datasets/{{ dataset.id }}/snapshots/{{ snapshot.version_number }}/actuals.csv">下载对账 CSV</a>
   </div>
 </section>
 
+{% if request.query_params.get('message') %}
+<div class="banner banner-ok">{{ request.query_params.get('message') }}</div>
+{% endif %}
+{% if request.query_params.get('error') %}
+<div class="banner banner-error">
+  <strong>整批退回：</strong>{{ request.query_params.get('error') }}
+  <div class="small">已保留原有的实产与对账结果，未做任何更改。</div>
+</div>
+{% endif %}
+
 <section class="card">
   {{ ui.result_tables(result, dataset.id, download_version=snapshot.version_number, readonly=True) }}
+</section>
+
+<section class="card">
+  <h2>实产上报与对账</h2>
+  <p class="muted">
+    在下面选择时段并上传实产 CSV（列：<span class="mono">node_id, quantity</span>，
+    车间或产线编号 + 非负整数产量）。同一编号可用后续批次更正。<br>
+    规则：已报实产的产线单独对账；车间报了总量时，扣掉已报产线实产，余额与未报产线的预测合计对账；
+    车间未报总量时，未报产线记为缺数。整批先合并再核对——余额为负、或产线报齐但合计与车间总量不符时，
+    整批退回并指出冲突车间。误差汇总使用同一组对账项，分别求校正前/后绝对误差之和。
+  </p>
+
+  {% for period in actuals.periods %}
+  {% set rec = actuals.reconciliations.get(period) %}
+  {% set recon = rec.result if rec else none %}
+  {% set batches = actuals.batches.get(period) %}
+  <details class="period {% if rec %}has-adjust{% endif %}" {% if rec or request.query_params.get('period') == period %}open{% endif %}>
+    <summary>
+      <span class="period-label">时段 {{ period }}</span>
+      {% if rec %}
+        <span class="pill pill-ok">{{ recon['items']|length }} 个对账项</span>
+        {% if recon.missing_lines %}<span class="pill pill-warn">{{ recon.missing_lines|length }} 条缺数产线</span>{% endif %}
+        <span class="muted small">校正前绝对误差合计 {{ num(recon.totals.base_error) }} → 校正后 {{ num(recon.totals.corrected_error) }}</span>
+      {% else %}
+        <span class="pill">尚未上报实产</span>
+      {% endif %}
+    </summary>
+    <div class="period-body">
+
+      <form class="row upload-inline" method="post"
+            action="/datasets/{{ dataset.id }}/snapshots/{{ snapshot.version_number }}/actuals"
+            enctype="multipart/form-data">
+        <input type="hidden" name="period" value="{{ period }}">
+        <label class="muted small">时段 {{ period }} 实产 CSV</label>
+        <input type="file" name="file" accept=".csv,text/csv" required>
+        <button type="submit">合并并核对</button>
+      </form>
+
+      {% if rec %}
+      <h4>误差汇总（同一组对账项）</h4>
+      <div class="result-summary">
+        <span class="stat">对账项 <strong>{{ recon.totals.item_count }}</strong></span>
+        <span class="stat">校正前绝对误差合计 <strong>{{ num(recon.totals.base_error) }}</strong></span>
+        <span class="stat">校正后绝对误差合计 <strong>{{ num(recon.totals.corrected_error) }}</strong></span>
+        <span class="stat {% if recon.totals.improvement < 0 %}warn{% endif %}">
+          变化 <strong>{{ "%+.3f"|format(recon.totals.improvement) }}</strong>
+        </span>
+      </div>
+
+      <h4>对账明细</h4>
+      <table class="compact">
+        <thead>
+          <tr>
+            <th>对账项</th><th>类型</th>
+            <th class="num">实产</th>
+            <th class="num">校正前预测</th><th class="num">校正后预测</th>
+            <th class="num">校正前误差</th><th class="num">校正后误差</th>
+            <th>覆盖产线</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for item in recon['items'] %}
+          <tr>
+            <td class="mono">{{ item.label }}</td>
+            <td>
+              {% if item.kind == 'line' %}<span class="tag tag-pub">已报产线</span>
+              {% else %}<span class="tag tag-level">车间余额</span>{% endif %}
+            </td>
+            <td class="num">{{ intfmt(item.actual) }}</td>
+            <td class="num">{{ num(item.base_forecast) }}</td>
+            <td class="num">{{ num(item.corrected_forecast) }}</td>
+            <td class="num">{{ num(item.base_error) }}</td>
+            <td class="num {{ 'pos' if item.corrected_error < item.base_error else ('neg' if item.corrected_error > item.base_error else '') }}">{{ num(item.corrected_error) }}</td>
+            <td>
+              {% for line in item.covered_lines %}
+                <span class="chip small">{{ line }}</span>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <h4>车间状态</h4>
+      <table class="compact">
+        <thead>
+          <tr><th>车间</th><th>状态</th><th class="num">实报总量</th><th class="num">已报产线合计</th><th class="num">余额</th><th>已报产线</th><th>缺数产线</th></tr>
+        </thead>
+        <tbody>
+        {% for s in recon.shops %}
+          <tr>
+            <td class="mono">{{ s.shop_id }} <span class="muted">{{ s.shop_name }}</span></td>
+            <td>{{ shop_status(s) }}</td>
+            <td class="num">{{ intfmt(s.total) }}</td>
+            <td class="num">{{ intfmt(s.reported_line_sum) }}</td>
+            <td class="num">{{ intfmt(s.remainder) }}</td>
+            <td>{% for line in s.reported_lines %}<span class="chip small">{{ line }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
+            <td>{% for line in s.missing_lines %}<span class="chip small">{{ line }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if recon.missing_lines %}
+      <div class="banner banner-warn">
+        <strong>缺数产线：</strong>{{ recon.missing_lines|join('、') }}
+        <div class="small">所属车间未报总量，这些产线既无实产、也无余额可对账，不计入误差汇总。</div>
+      </div>
+      {% endif %}
+      {% endif %}
+
+      <h4>本时段批次记录</h4>
+      {% if batches %}
+      <table class="compact">
+        <thead><tr><th>批次</th><th>时间</th><th>文件</th><th>行数</th><th>结果</th><th>说明</th></tr></thead>
+        <tbody>
+        {% for b in batches %}
+          <tr>
+            <td>#{{ b.id }}</td>
+            <td class="mono small">{{ b.created_at }}</td>
+            <td class="mono small">{{ b.filename or '—' }}</td>
+            <td class="num">{{ b.row_count }}</td>
+            <td>
+              {% if b.status == 'applied' %}<span class="pill pill-ok">已应用</span>
+              {% else %}<span class="pill pill-warn">已退回</span>{% endif %}
+            </td>
+            <td class="small">{{ b.message }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="muted">该时段还没有上传过实产。</p>
+      {% endif %}
+
+    </div>
+  </details>
+  {% endfor %}
 </section>
 {% endblock %}

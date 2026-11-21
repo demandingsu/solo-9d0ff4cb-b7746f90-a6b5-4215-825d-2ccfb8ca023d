@@ -23,6 +23,20 @@ class SnapshotValidationError(ReconciliationError):
     code = "snapshot_validation_error"
 
 
+class ActualsValidationError(ReconciliationError):
+    """A batch of actual production figures violates the reporting rules.
+
+    ``details`` carries machine-readable context (for example the conflicting
+    shops) so the API can return it and the page can render it.
+    """
+
+    code = "actuals_validation_error"
+
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
 class OptimizationError(ReconciliationError):
     """The weighted least-squares correction could not be solved."""
 

@@ -13,10 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .db import Database
-from .errors import ReconciliationError
+from .errors import ActualsValidationError, ReconciliationError
 from .service import (
     KIND_LABELS,
     ReconciliationService,
+    actuals_reconciliation_to_csv,
     adjustments_to_csv,
     conflicts_to_csv,
     result_to_csv,
@@ -44,11 +45,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def handle_reconciliation_error(request: Request, exc: ReconciliationError):
         wants_json = request.url.path.startswith("/api/")
         if wants_json:
-            return JSONResponse(
-                status_code=400,
-                content={"error": str(exc), "code": exc.code},
-            )
+            content: dict[str, Any] = {"error": str(exc), "code": exc.code}
+            details = getattr(exc, "details", None)
+            if details:
+                content["details"] = details
+            return JSONResponse(status_code=400, content=content)
         dataset_id = request.path_params.get("dataset_id")
+        version_number = request.path_params.get("version_number")
+        if (
+            version_number is not None
+            and dataset_id is not None
+            and request.method == "GET"
+            and database.get_dataset(int(dataset_id)) is not None
+        ):
+            return RedirectResponse(
+                url=(
+                    f"/datasets/{int(dataset_id)}/snapshots/{int(version_number)}"
+                    f"?error={quote(str(exc))}&error_code={exc.code}"
+                ),
+                status_code=303,
+            )
         if dataset_id is None or database.get_dataset(int(dataset_id)) is None:
             return templates.TemplateResponse(
                 request,
@@ -131,6 +147,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if snapshot is None:
             raise HTTPException(status_code=404, detail="快照不存在")
         result = ReconciliationResult.from_dict(snapshot["result"])
+        actuals_state = service.actuals_state(dataset_id, version_number)
         return templates.TemplateResponse(
             request,
             "snapshot.html",
@@ -139,9 +156,51 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "dataset": database.get_dataset(dataset_id),
                 "snapshot": snapshot,
                 "result": result,
+                "actuals": actuals_state,
                 "kind_labels": KIND_LABELS,
                 "readonly": True,
             },
+        )
+
+    @app.post("/datasets/{dataset_id}/snapshots/{version_number}/actuals")
+    def upload_actuals(
+        dataset_id: int,
+        version_number: int,
+        period: str = Form(...),
+        file: UploadFile = None,  # type: ignore[assignment]
+    ):
+        snapshot = database.get_snapshot(dataset_id, version_number)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        if file is None:
+            raise HTTPException(status_code=400, detail="未选择文件")
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="文件超出大小限制")
+        try:
+            outcome = service.submit_actuals(
+                dataset_id, version_number, period, file.filename or "actuals.csv", data
+            )
+        except ActualsValidationError as exc:
+            # Keep the current actuals and reconciliation untouched; send the
+            # analyst back to the snapshot page with the conflicting shops.
+            conflicts = exc.details.get("conflicts", [])
+            detail = str(exc)
+            if conflicts:
+                detail += " 冲突车间：" + "、".join(c["shop_id"] for c in conflicts)
+            return RedirectResponse(
+                url=(
+                    f"/datasets/{dataset_id}/snapshots/{version_number}"
+                    f"?period={quote(period)}&error={quote(detail)}&error_code={exc.code}"
+                ),
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=(
+                f"/datasets/{dataset_id}/snapshots/{version_number}"
+                f"?period={quote(period)}&message={quote(outcome['message'])}"
+            ),
+            status_code=303,
         )
 
     # ------------------------------------------------------------------
@@ -234,6 +293,65 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if snapshot is None:
             raise HTTPException(status_code=404, detail="快照不存在")
         return snapshot
+
+    @app.post("/api/datasets/{dataset_id}/snapshots/{version_number}/actuals")
+    async def api_upload_actuals(
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        file: UploadFile,
+    ):
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="文件超出大小限制")
+        outcome = service.submit_actuals(
+            dataset_id, version_number, period, file.filename or "actuals.csv", data
+        )
+        return outcome
+
+    @app.get("/api/datasets/{dataset_id}/snapshots/{version_number}/actuals")
+    def api_actuals(dataset_id: int, version_number: int, period: str | None = None):
+        state = service.actuals_state(dataset_id, version_number)
+        if state is None:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        reconciliations = state["reconciliations"]
+        if period is not None:
+            stored = reconciliations.get(period)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="该时段尚未上报实产")
+            return {
+                "period": period,
+                "updated_at": stored["updated_at"],
+                "reconciliation": stored["result"],
+                "batches": state["batches"][period],
+            }
+        return {
+            "version_number": version_number,
+            "periods": {
+                period: (stored["result"] if stored else None)
+                for period, stored in reconciliations.items()
+            },
+            "batches": state["batches"],
+        }
+
+    @app.get("/api/datasets/{dataset_id}/snapshots/{version_number}/actuals.csv")
+    def api_actuals_csv(dataset_id: int, version_number: int, period: str | None = None):
+        state = service.actuals_state(dataset_id, version_number)
+        if state is None:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        periods = [period] if period is not None else state["periods"]
+        if period is not None and period not in state["periods"]:
+            raise HTTPException(status_code=404, detail="时段不在该快照中")
+        body = actuals_reconciliation_to_csv(
+            [(p, state["reconciliations"].get(p)) for p in periods]
+        )
+        return Response(
+            content="﻿" + body,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="actuals-v{version_number}.csv"'
+            },
+        )
 
     @app.get("/healthz")
     def healthz():

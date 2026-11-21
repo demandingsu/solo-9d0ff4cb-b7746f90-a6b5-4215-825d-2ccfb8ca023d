@@ -147,6 +147,99 @@ def test_health(client):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
+def _published_version(client) -> int:
+    ds = ready(client)
+    preview = client.post(f"/api/datasets/{ds}/preview").json()
+    version = client.post(
+        f"/api/datasets/{ds}/publish", json={"preview_id": preview["preview_id"]}
+    ).json()["version_number"]
+    return ds, version
+
+
+def test_snapshot_actuals_upload_updates_detail_and_summary(client):
+    ds, version = _published_version(client)
+    resp = client.post(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals",
+        params={"period": "2026-01"},
+        files={"file": ("a.csv", b"node_id,quantity\nS1,50\nL1,15\n", "text/csv")},
+    )
+    assert resp.status_code == 200
+    recon = resp.json()["reconciliation"]
+    assert recon["totals"]["item_count"] == 2
+    page = client.get(f"/datasets/{ds}/snapshots/{version}")
+    assert page.status_code == 200
+    for token in ("实产上报与对账", "误差汇总", "对账明细", "车间状态", "缺数产线"):
+        assert token in page.text
+    assert "L1 产线1" in page.text
+    # Detail and summary in the stored page match the API response.
+    assert f"{recon['totals']['base_error']:.3f}" in page.text
+
+    csv_resp = client.get(f"/api/datasets/{ds}/snapshots/{version}/actuals.csv")
+    assert csv_resp.status_code == 200
+    assert "corrected_error" in csv_resp.text.splitlines()[0]
+
+    api = client.get(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals", params={"period": "2026-01"}
+    ).json()
+    assert api["reconciliation"]["totals"] == recon["totals"]
+
+
+def test_snapshot_actuals_batch_rejection_keeps_previous_result(client):
+    ds, version = _published_version(client)
+    ok = client.post(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals",
+        params={"period": "2026-01"},
+        files={"file": ("a.csv", b"node_id,quantity\nS1,50\nL1,15\n", "text/csv")},
+    )
+    assert ok.status_code == 200
+    before = client.get(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals", params={"period": "2026-01"}
+    ).json()["reconciliation"]
+
+    bad = client.post(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals",
+        params={"period": "2026-01"},
+        files={"file": ("b.csv", b"node_id,quantity\nS1,1\n", "text/csv")},
+    )
+    assert bad.status_code == 400
+    assert bad.json()["code"] == "actuals_validation_error"
+    assert bad.json()["details"]["conflicts"][0]["shop_id"] == "S1"
+
+    after = client.get(
+        f"/api/datasets/{ds}/snapshots/{version}/actuals", params={"period": "2026-01"}
+    ).json()["reconciliation"]
+    assert after == before
+
+    form = client.post(
+        f"/datasets/{ds}/snapshots/{version}/actuals",
+        data={"period": "2026-01"},
+        files={"file": ("c.csv", b"node_id,quantity\nS1,1\n", "text/csv")},
+        follow_redirects=False,
+    )
+    assert form.status_code == 303
+    page = client.get(form.headers["location"])
+    assert "整批退回" in page.text
+    assert "冲突车间" in page.text
+
+
+def test_snapshot_page_without_actuals_still_renders(client):
+    ds, version = _published_version(client)
+    page = client.get(f"/datasets/{ds}/snapshots/{version}")
+    assert page.status_code == 200
+    assert "尚未上报实产" in page.text
+
+
+def test_actuals_for_missing_snapshot_returns_error(client):
+    ds, _version = _published_version(client)
+    resp = client.post(
+        f"/api/datasets/{ds}/snapshots/999/actuals",
+        params={"period": "2026-01"},
+        files={"file": ("a.csv", b"node_id,quantity\nL1,1\n", "text/csv")},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "publish_error"
+
+
 def test_upload_to_missing_dataset_renders_error_page(client):
     resp = client.post(
         "/datasets/12345/upload",

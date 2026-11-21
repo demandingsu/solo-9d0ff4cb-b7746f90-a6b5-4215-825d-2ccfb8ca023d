@@ -21,8 +21,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import db as db_module
-from .csv_io import parse_forecast, parse_mapping, parse_published
+from .actuals import evaluate_actuals
+from .csv_io import parse_actuals, parse_forecast, parse_mapping, parse_published
 from .errors import (
+    ActualsValidationError,
     CsvParseError,
     PublishError,
     ReconciliationError,
@@ -339,6 +341,250 @@ class ReconciliationService:
         }
 
     # ------------------------------------------------------------------
+    # Actual production reporting against a published snapshot
+    # ------------------------------------------------------------------
+    def submit_actuals(
+        self,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        filename: str,
+        data: bytes,
+    ) -> dict[str, Any]:
+        """Merge one batch of actuals into a snapshot period and reconcile.
+
+        The whole batch is merged with the already stored actuals *before* any
+        rule is checked, so a later correction of a line is judged in the
+        context of the full state.  On any rule violation the transaction is
+        rolled back: the previously stored actuals and reconciliation stay
+        exactly as they were.  Success updates both the detail and the error
+        summary atomically.
+        """
+        snapshot = self.db.get_snapshot(dataset_id, version_number)
+        if snapshot is None:
+            raise PublishError("快照不存在。")
+        result = ReconciliationResult.from_dict(snapshot["result"])
+        period_result = next((p for p in result.periods if p.period == period), None)
+        if period_result is None:
+            raise ActualsValidationError(
+                f"时段 {period} 不在快照 v{version_number} 中。"
+            )
+        hierarchy = result.hierarchy
+        line_ids = set(hierarchy.by_level.get("line", []))
+        shop_ids = set(hierarchy.by_level.get("shop", []))
+
+        try:
+            rows = parse_actuals(data, filename)
+        except ReconciliationError as exc:
+            self._record_actuals_rejection(
+                dataset_id, version_number, period, filename, 0, exc
+            )
+            raise
+        if not rows:
+            raise ActualsValidationError("实产文件没有数据行。")
+
+        # Validate row ids before opening a write transaction.
+        unknown: list[str] = []
+        wrong_level: list[str] = []
+        for row in rows:
+            if row.node_id in line_ids:
+                continue
+            if row.node_id in shop_ids:
+                continue
+            if row.node_id in hierarchy.nodes:
+                wrong_level.append(row.node_id)
+            else:
+                unknown.append(row.node_id)
+        try:
+            if unknown:
+                raise ActualsValidationError(
+                    "实产文件包含映射里不存在的车间/产线："
+                    + ", ".join(sorted(set(unknown))[:10]),
+                    {"unknown_nodes": sorted(set(unknown))},
+                )
+            if wrong_level:
+                raise ActualsValidationError(
+                    "实产只能报车间或产线，以下节点层级不符："
+                    + ", ".join(sorted(set(wrong_level))[:10]),
+                    {"wrong_level_nodes": sorted(set(wrong_level))},
+                )
+
+            with self.db.connect() as conn:
+                batch_id, reconciliation, message = self._apply_actuals_batch(
+                    conn, dataset_id, version_number, period, filename, rows,
+                    hierarchy, line_ids, period_result,
+                )
+                self.db.log_event(
+                    conn,
+                    dataset_id,
+                    "actuals_applied",
+                    f"快照 v{version_number} 时段 {period} 实产批次 #{batch_id} 已应用：{message}",
+                    {"filename": filename, "rows": len(rows)},
+                )
+        except ActualsValidationError as exc:
+            # The transaction rolled back, so actual_values and the stored
+            # reconciliation are exactly as before.  Record the rejection in a
+            # separate transaction so it can never resurrect a failed merge.
+            self._record_actuals_rejection(
+                dataset_id, version_number, period, filename, len(rows), exc
+            )
+            raise
+        return {
+            "batch_id": batch_id,
+            "version_number": version_number,
+            "period": period,
+            "message": message,
+            "reconciliation": reconciliation,
+        }
+
+    def _record_actuals_rejection(
+        self,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        filename: str,
+        row_count: int,
+        exc: ReconciliationError,
+    ) -> None:
+        details = getattr(exc, "details", None)
+        try:
+            with self.db.connect() as conn:
+                self.db.record_actual_batch(
+                    conn,
+                    dataset_id,
+                    version_number,
+                    period,
+                    filename,
+                    "rejected",
+                    str(exc),
+                    row_count,
+                    details,
+                )
+                self.db.log_event(
+                    conn,
+                    dataset_id,
+                    "actuals_rejected",
+                    f"快照 v{version_number} 时段 {period} 实产批次被拒绝：{exc}",
+                    {
+                        "error_code": exc.code,
+                        "filename": filename,
+                        "conflicts": (details or {}).get("conflicts", []),
+                    },
+                )
+        except Exception:  # pragma: no cover - recording must not mask the error
+            pass
+
+    def _apply_actuals_batch(
+        self,
+        conn: Any,
+        dataset_id: int,
+        version_number: int,
+        period: str,
+        filename: str,
+        rows: list[Any],
+        hierarchy: Any,
+        line_ids: set[str],
+        period_result: Any,
+    ) -> tuple[int, dict[str, Any], str]:
+        """Merge + validate + store one batch inside an existing transaction.
+
+        Validation happens before any write; a raised ``ActualsValidationError``
+        rolls the whole transaction back, leaving stored actuals and the prior
+        reconciliation unchanged.
+        """
+        stored = self.db.actual_values(dataset_id, version_number, period, conn)
+        line_reports: dict[str, int] = {}
+        shop_totals: dict[str, int] = {}
+        for node_id, value in stored.items():
+            if value["kind"] == "line":
+                line_reports[node_id] = value["quantity"]
+            else:
+                shop_totals[node_id] = value["quantity"]
+
+        # Last row wins for a repeated id: a later row/batch is a correction.
+        batch_values: dict[str, tuple[str, int]] = {}
+        for row in rows:
+            kind = "line" if row.node_id in line_ids else "shop"
+            batch_values[row.node_id] = (kind, row.quantity)
+        for node_id, (kind, quantity) in batch_values.items():
+            if kind == "line":
+                line_reports[node_id] = quantity
+            else:
+                shop_totals[node_id] = quantity
+
+        # Validate the merged state before writing anything.
+        evaluation = evaluate_actuals(
+            hierarchy,
+            period_result.base,
+            period_result.corrected,
+            line_reports,
+            shop_totals,
+        )
+
+        row_count = len(rows)
+        batch_id = self.db.record_actual_batch(
+            conn,
+            dataset_id,
+            version_number,
+            period,
+            filename,
+            "applied",
+            "已应用",
+            row_count,
+            {"nodes": sorted(batch_values)},
+        )
+        self.db.upsert_actual_values(
+            conn, dataset_id, version_number, period, batch_values, batch_id
+        )
+        reconciliation = {
+            "period": period,
+            "version_number": version_number,
+            "items": evaluation["items"],
+            "shops": evaluation["shops"],
+            "missing_lines": evaluation["missing_lines"],
+            "reported_lines": evaluation["reported_lines"],
+            "reported_shops": evaluation["reported_shops"],
+            "totals": evaluation["totals"],
+            "actuals": {
+                **dict(sorted(line_reports.items())),
+                **dict(sorted(shop_totals.items())),
+            },
+        }
+        self.db.save_actual_reconciliation(
+            conn, dataset_id, version_number, period, reconciliation
+        )
+        message = (
+            f"已合并 {row_count} 行实产并完成对账："
+            f"{len(reconciliation['items'])} 个对账项，"
+            f"缺数产线 {len(reconciliation['missing_lines'])} 条。"
+        )
+        conn.execute(
+            "UPDATE actual_batches SET message=? WHERE id=?", (message, batch_id)
+        )
+        return batch_id, reconciliation, message
+
+    def actuals_state(self, dataset_id: int, version_number: int) -> dict[str, Any] | None:
+        """All actuals and reconciliations for a snapshot, for the page."""
+        snapshot = self.db.get_snapshot(dataset_id, version_number)
+        if snapshot is None:
+            return None
+        result = ReconciliationResult.from_dict(snapshot["result"])
+        periods = [p.period for p in result.periods]
+        stored_recon = self.db.list_actual_reconciliations(dataset_id, version_number)
+        return {
+            "snapshot": snapshot,
+            "result": result,
+            "periods": periods,
+            "reconciliations": {
+                period: stored_recon.get(period) for period in periods
+            },
+            "batches": {
+                period: self.db.list_actual_batches(dataset_id, version_number, period)
+                for period in periods
+            },
+        }
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _get_preview(self, dataset_id: int, preview_id: int, conn: Any) -> dict[str, Any]:
@@ -459,6 +705,47 @@ def conflicts_to_csv(result: ReconciliationResult) -> str:
                     f"{conflict['base']:.6f}",
                     f"{conflict['published']:.6f}",
                     f"{conflict['diff']:.6f}",
+                ]
+            )
+    return buffer.getvalue()
+
+
+def actuals_reconciliation_to_csv(
+    reconciliations: list[tuple[str, dict[str, Any] | None]]
+) -> str:
+    """Per-item actuals reconciliation with both forecast sets and errors."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "period",
+            "kind",
+            "node_id",
+            "label",
+            "actual",
+            "base_forecast",
+            "corrected_forecast",
+            "base_error",
+            "corrected_error",
+            "covered_lines",
+        ]
+    )
+    for period, stored in reconciliations:
+        if stored is None:
+            continue
+        for item in stored["result"]["items"]:
+            writer.writerow(
+                [
+                    period,
+                    item["kind"],
+                    item["node_id"],
+                    item["label"],
+                    item["actual"],
+                    f"{item['base_forecast']:.6f}",
+                    f"{item['corrected_forecast']:.6f}",
+                    f"{item['base_error']:.6f}",
+                    f"{item['corrected_error']:.6f}",
+                    ";".join(item["covered_lines"]),
                 ]
             )
     return buffer.getvalue()
